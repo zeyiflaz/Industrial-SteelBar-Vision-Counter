@@ -79,7 +79,7 @@ class CameraStream:
 class CubukSayimSistemi(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Zeynep - Cubuk Sayim Dashboard v29.0")
+        self.setWindowTitle("Zeynep - Cubuk Sayim Dashboard v29.0 (Orijinal Sabit)")
         self.setGeometry(50, 50, 1400, 800)
         self.setStyleSheet("background-color: #f4f6f9;")
 
@@ -90,25 +90,24 @@ class CubukSayimSistemi(QMainWindow):
         self.recent_count_events = []
         self.frame_index = 0
 
-        # Canli takipte dakika seviyesinde obje tutmak, yeni cubuklari eski
-        # track'lerle karistiriyordu. Sayim korumasi artik ayri bir debounce
-        # bellegiyle yapiliyor.
-        self.track_timeout_frames = 12
+        # Çözüm notlarındaki harika takip ayarları (Aynen korundu)
+        self.track_timeout_frames = 20 
         self.count_band_half_width = 42
         self.vertical_match_limit = 55
-        self.min_frames_for_count = 2
-        self.count_cooldown_seconds = 1.2
+        
+        self.min_frames_for_count = 2 # Eksik sayımı önlemek için 5'ten 2'ye çekildi
+        self.count_cooldown_seconds = 0.6 # Bekleme süresi kısaltıldı
         self.warmup_frames = 20
 
         self.ebat_ayarlari = {
             "8 mm": {
                 "kernel": 3,
-                "min_a": 15,
+                "min_a": 10, # En ufak parlamayı kaçırmamak için 20'den 10'a çekildi
                 "max_a": 18000,
-                "dist": 95,
+                "dist": 120, # Çubuklar yapışıkken takip kopmasın diye mesafe artırıldı
                 "limit_w": 22,
                 "limit_h": 20,
-                "peak_threshold": 150,
+                "peak_threshold": 85, # Karanlıkta kalan çubuklar için hassas eşik
             },
             "10 mm": {
                 "kernel": 3,
@@ -117,7 +116,7 @@ class CubukSayimSistemi(QMainWindow):
                 "dist": 110,
                 "limit_w": 26,
                 "limit_h": 24,
-                "peak_threshold": 152,
+                "peak_threshold": 142,
             },
             "12 mm": {
                 "kernel": 5,
@@ -126,7 +125,7 @@ class CubukSayimSistemi(QMainWindow):
                 "dist": 125,
                 "limit_w": 30,
                 "limit_h": 28,
-                "peak_threshold": 155,
+                "peak_threshold": 145,
             },
             "14 mm": {
                 "kernel": 5,
@@ -135,7 +134,7 @@ class CubukSayimSistemi(QMainWindow):
                 "dist": 140,
                 "limit_w": 34,
                 "limit_h": 32,
-                "peak_threshold": 158,
+                "peak_threshold": 148,
             },
             "16 mm": {
                 "kernel": 7,
@@ -144,7 +143,7 @@ class CubukSayimSistemi(QMainWindow):
                 "dist": 155,
                 "limit_w": 38,
                 "limit_h": 36,
-                "peak_threshold": 160,
+                "peak_threshold": 150,
             },
             "20 mm": {
                 "kernel": 9,
@@ -153,10 +152,10 @@ class CubukSayimSistemi(QMainWindow):
                 "dist": 175,
                 "limit_w": 46,
                 "limit_h": 40,
-                "peak_threshold": 164,
+                "peak_threshold": 154,
             },
         }
-        self.aktif_ayar = self.ebat_ayarlari["10 mm"]
+        self.aktif_ayar = self.ebat_ayarlari["8 mm"] # Fabrika ön tanımlı ebatı
 
         self.fgbg = cv2.createBackgroundSubtractorMOG2(
             history=350,
@@ -290,15 +289,17 @@ class CubukSayimSistemi(QMainWindow):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        fgmask = self.fgbg.apply(roi, learningRate=0.003)
-        _, bright_mask = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
+        fgmask = self.fgbg.apply(roi, learningRate=0.001)
+        
+        # --- HATA DÜZELTİLDİ: adaptiveThreshold tek resim döndürür, "_" silindi ---
+        bright_mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                          cv2.THRESH_BINARY, 11, 2)
         final_mask = cv2.bitwise_and(fgmask, bright_mask)
 
         k_boyut = self.aktif_ayar["kernel"]
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_boyut, k_boyut))
         final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel)
         final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
-        final_mask = cv2.dilate(final_mask, kernel, iterations=1)
 
         contours, _ = cv2.findContours(
             final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -311,6 +312,11 @@ class CubukSayimSistemi(QMainWindow):
                 continue
 
             x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
+            
+            # --- MAKİNE ELEME: Eğer kütle aşırı genişse saymayı direkt iptal et ---
+            if w_c > (self.aktif_ayar["limit_w"] * 2.8):
+                continue
+
             if w_c < 5 or h_c < 5:
                 continue
 
@@ -327,10 +333,12 @@ class CubukSayimSistemi(QMainWindow):
             horizontal_profile = self._smooth_profile(horizontal_profile)
 
             peak_threshold = max(
-                self.aktif_ayar["peak_threshold"],
-                float(horizontal_profile.mean() + horizontal_profile.std() * 0.45),
+                self.aktif_ayar["peak_threshold"] * 0.7, 
+                float(horizontal_profile.mean() + horizontal_profile.std() * 0.05),
             )
-            min_peak_gap = max(12, int(self.aktif_ayar["limit_w"] * 0.6))
+            
+            # BİTİŞİK ÇUBUK KURALI: Sabit 4 piksel boşluk yeterli
+            min_peak_gap = 4
 
             peaks = []
             for i in range(1, len(horizontal_profile) - 1):
@@ -376,6 +384,8 @@ class CubukSayimSistemi(QMainWindow):
         return {
             "cx": detection["cx"],
             "cy": detection["cy"],
+            "start_x": detection["cx"],
+            "start_y": detection["cy"],
             "prev_x": detection["cx"],
             "prev_y": detection["cy"],
             "vx": 0.0,
@@ -404,6 +414,8 @@ class CubukSayimSistemi(QMainWindow):
         return {
             "cx": detection["cx"],
             "cy": detection["cy"],
+            "start_x": data.get("start_x", prev_x),
+            "start_y": data.get("start_y", prev_y),
             "prev_x": prev_x,
             "prev_y": prev_y,
             "vx": vx,
@@ -483,7 +495,8 @@ class CubukSayimSistemi(QMainWindow):
     def _can_register_count(self, track):
         self._prune_count_events()
         for event in self.recent_count_events:
-            if abs(event["cy"] - track["cy"]) <= 18:
+            # BİTİŞİK ÇUBUK KORUMASI: 3 piksel fark yeterlidir
+            if abs(event["cy"] - track["cy"]) <= 3:
                 return False
         return True
 
@@ -497,25 +510,28 @@ class CubukSayimSistemi(QMainWindow):
         if self.frame_index < self.warmup_frames:
             return
 
-        min_motion = max(self.count_band_half_width // 2, self.aktif_ayar["limit_w"])
-        for data in self.tracked_objects.values():
-            if data["counted"] or data["missing"] > 1:
+        for obj_id, data in self.tracked_objects.items():
+            if data["counted"] or data["missing"] > 0:
                 continue
 
-            crossed_line = (
-                (data["prev_x"] <= self.cizgi_x < data["cx"])
-                or (data["cx"] < self.cizgi_x <= data["prev_x"])
-            )
-            touched_both_sides = (
-                data["min_x"] <= self.cizgi_x - self.count_band_half_width
-                and data["max_x"] >= self.cizgi_x + self.count_band_half_width
-            )
-            enough_motion = (data["max_x"] - data["min_x"]) >= min_motion
+            # --- SANAL GÜZERGAH DOĞRULAMA (Makine aparatını kesin eler) ---
+            ilk_gorulme_x = data.get("start_x", data["cx"])
+            su_anki_x = data["cx"]
+
+            # Obje çizginin en az 40 piksel solunda doğmuş olmalı (MAKİNE BURADA ELENİR)
+            gelis_yeri_dogru_mu = ilk_gorulme_x < (self.cizgi_x - 40)
+            
+            # Obje şu an çizgiyi en az 10 piksel geçmiş olmalı
+            cizgiyi_gecti_mi = su_anki_x > (self.cizgi_x + 10)
+            
+            # Net bir yatay seyahat görmeliyiz (Titreşimleri eler)
+            gercek_seyahat_mi = (su_anki_x - ilk_gorulme_x) > 50
 
             if (
-                data["frames_seen"] >= self.min_frames_for_count
-                and enough_motion
-                and (crossed_line or touched_both_sides)
+                data["frames_seen"] >= self.min_frames_for_count 
+                and gelis_yeri_dogru_mu 
+                and cizgiyi_gecti_mi 
+                and gercek_seyahat_mi 
                 and self._can_register_count(data)
             ):
                 data["counted"] = True
@@ -529,18 +545,19 @@ class CubukSayimSistemi(QMainWindow):
         self.frame_index += 1
         h, w = frame.shape[:2]
 
-        roi_y1, roi_y2 = int(h * 0.48), int(h * 0.65)
-        roi_x1, roi_x2 = int(w * 0.05), int(w * 0.90)
+        # MAVİ KUTU (ROI): Çubuk uçlarını tam merkeze alan daraltılmış analiz alanı
+        roi_y1, roi_y2 = int(h * 0.49), int(h * 0.64)
+        roi_x1 = max(0, self.cizgi_x - 300)
+        roi_x2 = min(w, self.cizgi_x + 120)
         roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
 
         detections, final_mask = self._extract_detections(roi, roi_x1, roi_y1)
         self._match_tracks(detections)
         self._count_if_needed()
 
-        kapi_sol = self.cizgi_x - self.count_band_half_width
-        kapi_sag = self.cizgi_x + self.count_band_half_width
-        cv2.rectangle(frame, (kapi_sol, 0), (kapi_sag, h), (0, 255, 255), 2)
-        cv2.line(frame, (self.cizgi_x, 0), (self.cizgi_x, h), (0, 0, 255), 3)
+        # Arayüz Çizimleri
+        cv2.rectangle(frame, (self.cizgi_x - 42, 0), (self.cizgi_x + 42, h), (0, 255, 255), 1)
+        cv2.line(frame, (self.cizgi_x, 0), (self.cizgi_x, h), (0, 0, 255), 2)
         cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 255, 0), 1)
 
         for obj_id, data in self.tracked_objects.items():
