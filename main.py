@@ -1,6 +1,6 @@
 import os
 import sys
-import threading
+import threading 
 import time
 import urllib.parse
 
@@ -79,7 +79,7 @@ class CameraStream:
 class CubukSayimSistemi(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Zeynep - Cubuk Sayim Dashboard v29.0 (Orijinal Sabit)")
+        self.setWindowTitle("Zeynep - Cubuk Sayim Dashboard v31.0 (Tam Koruma)")
         self.setGeometry(50, 50, 1400, 800)
         self.setStyleSheet("background-color: #f4f6f9;")
 
@@ -95,19 +95,19 @@ class CubukSayimSistemi(QMainWindow):
         self.count_band_half_width = 42
         self.vertical_match_limit = 55
         
-        self.min_frames_for_count = 2 # Eksik sayımı önlemek için 5'ten 2'ye çekildi
-        self.count_cooldown_seconds = 0.6 # Bekleme süresi kısaltıldı
-        self.warmup_frames = 20
+        self.min_frames_for_count = 5 
+        self.count_cooldown_seconds = 0.6 
+        self.warmup_frames = 60 # Başlangıç ısınma süresi
 
         self.ebat_ayarlari = {
             "8 mm": {
                 "kernel": 3,
-                "min_a": 10, # En ufak parlamayı kaçırmamak için 20'den 10'a çekildi
+                "min_a": 10, 
                 "max_a": 18000,
-                "dist": 120, # Çubuklar yapışıkken takip kopmasın diye mesafe artırıldı
+                "dist": 120, 
                 "limit_w": 22,
                 "limit_h": 20,
-                "peak_threshold": 85, # Karanlıkta kalan çubuklar için hassas eşik
+                "peak_threshold": 85, 
             },
             "10 mm": {
                 "kernel": 3,
@@ -155,11 +155,11 @@ class CubukSayimSistemi(QMainWindow):
                 "peak_threshold": 154,
             },
         }
-        self.aktif_ayar = self.ebat_ayarlari["8 mm"] # Fabrika ön tanımlı ebatı
+        self.aktif_ayar = self.ebat_ayarlari["8 mm"]
 
         self.fgbg = cv2.createBackgroundSubtractorMOG2(
-            history=350,
-            varThreshold=32,
+            history=500, 
+            varThreshold=40, # Gürültü engellemek için eşik yükseltildi
             detectShadows=False,
         )
 
@@ -255,7 +255,10 @@ class CubukSayimSistemi(QMainWindow):
         self.aktif_ayar = self.ebat_ayarlari[secilen_ebat]
 
     def set_line_position(self, event):
+        # Çizgi değiştiğinde tüm eski takipleri temizle ve ısınma süresi başlat
         self.cizgi_x = int(event.pos().x() * (1280 / self.live_view.width()))
+        self.tracked_objects = {}
+        self.warmup_frames = self.frame_index + 30 # Çizgi değişince 1 saniye bekle
 
     def reset_count(self):
         self.sayilan_adet = 0
@@ -285,16 +288,17 @@ class CubukSayimSistemi(QMainWindow):
         kernel /= kernel.sum()
         return np.convolve(profile, kernel, mode="same")
 
-    def _extract_detections(self, roi, roi_x1, roi_y1):
+    def _extract_detections(self, roi, roi_x1, roi_y1, full_fgmask):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        fgmask = self.fgbg.apply(roi, learningRate=0.001)
+        # ARTIK MOG2 MASKESİNİ BURADA DEĞİL, ANA DÖNGÜDEN ALIYORUZ
+        # Bu sayede ROI kayınca maske bozulmuyor.
+        roi_fgmask = full_fgmask[roi_y1 : roi_y1 + roi.shape[0], roi_x1 : roi_x1 + roi.shape[1]]
         
-        # --- HATA DÜZELTİLDİ: adaptiveThreshold tek resim döndürür, "_" silindi ---
         bright_mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                           cv2.THRESH_BINARY, 11, 2)
-        final_mask = cv2.bitwise_and(fgmask, bright_mask)
+        final_mask = cv2.bitwise_and(roi_fgmask, bright_mask)
 
         k_boyut = self.aktif_ayar["kernel"]
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_boyut, k_boyut))
@@ -313,8 +317,8 @@ class CubukSayimSistemi(QMainWindow):
 
             x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
             
-            # --- MAKİNE ELEME: Eğer kütle aşırı genişse saymayı direkt iptal et ---
-            if w_c > (self.aktif_ayar["limit_w"] * 2.8):
+            # MAKİNE ELEME: Daha sert oran kontrolü
+            if w_c > (self.aktif_ayar["limit_w"] * 2.5) or (float(w_c)/max(h_c,1) > 1.2):
                 continue
 
             if w_c < 5 or h_c < 5:
@@ -337,7 +341,6 @@ class CubukSayimSistemi(QMainWindow):
                 float(horizontal_profile.mean() + horizontal_profile.std() * 0.05),
             )
             
-            # BİTİŞİK ÇUBUK KURALI: Sabit 4 piksel boşluk yeterli
             min_peak_gap = 4
 
             peaks = []
@@ -397,6 +400,7 @@ class CubukSayimSistemi(QMainWindow):
             "max_x": detection["cx"],
             "w": detection["w"],
             "h": detection["h"],
+            "creation_frame": self.frame_index 
         }
 
     def _update_track(self, data, detection):
@@ -427,6 +431,7 @@ class CubukSayimSistemi(QMainWindow):
             "max_x": max(data["max_x"], detection["cx"]),
             "w": detection["w"],
             "h": detection["h"],
+            "creation_frame": data["creation_frame"]
         }
 
     def _match_tracks(self, detections):
@@ -495,7 +500,6 @@ class CubukSayimSistemi(QMainWindow):
     def _can_register_count(self, track):
         self._prune_count_events()
         for event in self.recent_count_events:
-            # BİTİŞİK ÇUBUK KORUMASI: 3 piksel fark yeterlidir
             if abs(event["cy"] - track["cy"]) <= 3:
                 return False
         return True
@@ -507,6 +511,7 @@ class CubukSayimSistemi(QMainWindow):
         self.recent_count_events.append({"time": time.monotonic(), "cy": track["cy"]})
 
     def _count_if_needed(self):
+        # ISINMA VEYA TIKLAMA SONRASI BEKLEME
         if self.frame_index < self.warmup_frames:
             return
 
@@ -514,21 +519,19 @@ class CubukSayimSistemi(QMainWindow):
             if data["counted"] or data["missing"] > 0:
                 continue
 
-            # --- SANAL GÜZERGAH DOĞRULAMA (Makine aparatını kesin eler) ---
             ilk_gorulme_x = data.get("start_x", data["cx"])
             su_anki_x = data["cx"]
 
-            # Obje çizginin en az 40 piksel solunda doğmuş olmalı (MAKİNE BURADA ELENİR)
+            # Açılışta veya tıklama anında oluşan gürültüyü sayma
+            yeni_mi = data["creation_frame"] > (self.warmup_frames - 20)
+
             gelis_yeri_dogru_mu = ilk_gorulme_x < (self.cizgi_x - 40)
-            
-            # Obje şu an çizgiyi en az 10 piksel geçmiş olmalı
             cizgiyi_gecti_mi = su_anki_x > (self.cizgi_x + 10)
-            
-            # Net bir yatay seyahat görmeliyiz (Titreşimleri eler)
             gercek_seyahat_mi = (su_anki_x - ilk_gorulme_x) > 50
 
             if (
                 data["frames_seen"] >= self.min_frames_for_count 
+                and yeni_mi
                 and gelis_yeri_dogru_mu 
                 and cizgiyi_gecti_mi 
                 and gercek_seyahat_mi 
@@ -545,13 +548,16 @@ class CubukSayimSistemi(QMainWindow):
         self.frame_index += 1
         h, w = frame.shape[:2]
 
-        # MAVİ KUTU (ROI): Çubuk uçlarını tam merkeze alan daraltılmış analiz alanı
-        roi_y1, roi_y2 = int(h * 0.49), int(h * 0.64)
-        roi_x1 = max(0, self.cizgi_x - 300)
-        roi_x2 = min(w, self.cizgi_x + 120)
+        # ÇÖZÜM: Arka plan çıkarmayı tüm frame üzerinde yapıyoruz (ROI bağımsızlığı)
+        full_fgmask = self.fgbg.apply(frame, learningRate=-1)
+
+        roi_y1, roi_y2 = int(h * 0.32), int(h * 0.48)
+        roi_x1 = max(0, self.cizgi_x - 250)
+        roi_x2 = min(w, self.cizgi_x + 250)
         roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
 
-        detections, final_mask = self._extract_detections(roi, roi_x1, roi_y1)
+        # Analiz fonksiyonuna tam maskeyi gönderiyoruz
+        detections, final_mask = self._extract_detections(roi, roi_x1, roi_y1, full_fgmask)
         self._match_tracks(detections)
         self._count_if_needed()
 
