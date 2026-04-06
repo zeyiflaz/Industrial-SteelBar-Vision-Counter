@@ -1,16 +1,18 @@
 import os
 import sys
-import threading 
+import threading
 import time
 import urllib.parse
 
 import cv2
 import numpy as np
+
 try:
     from dotenv import load_dotenv
 except ImportError:
     def load_dotenv():
         return False
+
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
@@ -79,7 +81,7 @@ class CameraStream:
 class CubukSayimSistemi(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Zeynep - Cubuk Sayim Dashboard v31.0 (Tam Koruma)")
+        self.setWindowTitle("Zeynep - Cubuk Sayim Dashboard v32.0")
         self.setGeometry(50, 50, 1400, 800)
         self.setStyleSheet("background-color: #f4f6f9;")
 
@@ -87,81 +89,88 @@ class CubukSayimSistemi(QMainWindow):
         self.tracked_objects = {}
         self.next_obj_id = 0
         self.cizgi_x = 450
-        self.recent_count_events = []
         self.frame_index = 0
+        self.warmup_until_frame = 45
+        self.prev_roi_gray = None
+        self.recent_count_events = []
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-        # Çözüm notlarındaki harika takip ayarları (Aynen korundu)
-        self.track_timeout_frames = 20 
-        self.count_band_half_width = 42
-        self.vertical_match_limit = 55
-        
-        self.min_frames_for_count = 5 
-        self.count_cooldown_seconds = 0.6 
-        self.warmup_frames = 60 # Başlangıç ısınma süresi
+        self.track_timeout_frames = 10
+        self.count_band_half_width = 34
+        self.vertical_match_limit = 28
+        self.count_cooldown_seconds = 0.85
+        self.max_vertical_speed = 6.5
+        self.min_horizontal_speed = 1.2
 
         self.ebat_ayarlari = {
             "8 mm": {
                 "kernel": 3,
-                "min_a": 10, 
-                "max_a": 18000,
-                "dist": 120, 
-                "limit_w": 22,
-                "limit_h": 20,
-                "peak_threshold": 85, 
+                "min_a": 10,
+                "max_a": 2200,
+                "dist": 80,
+                "limit_w": 16,
+                "limit_h": 12,
+                "motion_threshold": 16,
+                "bright_percentile": 76,
+                "peak_threshold": 158,
             },
             "10 mm": {
                 "kernel": 3,
-                "min_a": 20,
-                "max_a": 22000,
-                "dist": 110,
-                "limit_w": 26,
-                "limit_h": 24,
-                "peak_threshold": 142,
+                "min_a": 12,
+                "max_a": 2600,
+                "dist": 90,
+                "limit_w": 18,
+                "limit_h": 14,
+                "motion_threshold": 17,
+                "bright_percentile": 75,
+                "peak_threshold": 160,
             },
             "12 mm": {
                 "kernel": 5,
-                "min_a": 25,
-                "max_a": 27000,
-                "dist": 125,
-                "limit_w": 30,
-                "limit_h": 28,
-                "peak_threshold": 145,
+                "min_a": 16,
+                "max_a": 3200,
+                "dist": 95,
+                "limit_w": 20,
+                "limit_h": 16,
+                "motion_threshold": 18,
+                "bright_percentile": 74,
+                "peak_threshold": 162,
             },
             "14 mm": {
                 "kernel": 5,
-                "min_a": 30,
-                "max_a": 32000,
-                "dist": 140,
-                "limit_w": 34,
-                "limit_h": 32,
-                "peak_threshold": 148,
+                "min_a": 20,
+                "max_a": 3800,
+                "dist": 100,
+                "limit_w": 22,
+                "limit_h": 18,
+                "motion_threshold": 19,
+                "bright_percentile": 73,
+                "peak_threshold": 164,
             },
             "16 mm": {
                 "kernel": 7,
-                "min_a": 35,
-                "max_a": 38000,
-                "dist": 155,
-                "limit_w": 38,
-                "limit_h": 36,
-                "peak_threshold": 150,
+                "min_a": 24,
+                "max_a": 4600,
+                "dist": 110,
+                "limit_w": 24,
+                "limit_h": 18,
+                "motion_threshold": 20,
+                "bright_percentile": 72,
+                "peak_threshold": 166,
             },
             "20 mm": {
                 "kernel": 9,
-                "min_a": 40,
-                "max_a": 46000,
-                "dist": 175,
-                "limit_w": 46,
-                "limit_h": 40,
-                "peak_threshold": 154,
+                "min_a": 28,
+                "max_a": 5600,
+                "dist": 120,
+                "limit_w": 28,
+                "limit_h": 20,
+                "motion_threshold": 21,
+                "bright_percentile": 71,
+                "peak_threshold": 168,
             },
         }
-        self.aktif_ayar = self.ebat_ayarlari["8 mm"]
-
-        self.fgbg = cv2.createBackgroundSubtractorMOG2(
-            history=500, 
-            varThreshold=40, # Gürültü engellemek için eşik yükseltildi
-            detectShadows=False,
-        )
+        self.aktif_ayar = self.ebat_ayarlari["10 mm"]
 
         self.init_ui()
         self.vs = CameraStream(URL)
@@ -253,19 +262,24 @@ class CubukSayimSistemi(QMainWindow):
 
     def ebat_degistir(self, secilen_ebat):
         self.aktif_ayar = self.ebat_ayarlari[secilen_ebat]
+        self._reset_analysis_state(extra_warmup=20)
 
     def set_line_position(self, event):
-        # Çizgi değiştiğinde tüm eski takipleri temizle ve ısınma süresi başlat
         self.cizgi_x = int(event.pos().x() * (1280 / self.live_view.width()))
-        self.tracked_objects = {}
-        self.warmup_frames = self.frame_index + 30 # Çizgi değişince 1 saniye bekle
+        self._reset_analysis_state(extra_warmup=20)
 
     def reset_count(self):
         self.sayilan_adet = 0
         self.label_sayac.setText("0")
+        self.label_sayac.setStyleSheet(self.sayac_normal_stil)
+        self._reset_analysis_state(extra_warmup=35)
+
+    def _reset_analysis_state(self, extra_warmup):
         self.tracked_objects = {}
         self.recent_count_events = []
-        self.label_sayac.setStyleSheet(self.sayac_normal_stil)
+        self.prev_roi_gray = None
+        self.next_obj_id = 0
+        self.warmup_until_frame = self.frame_index + extra_warmup
 
     def hedef_kontrol(self):
         hedef_metin = self.input_hedef.text()
@@ -288,22 +302,66 @@ class CubukSayimSistemi(QMainWindow):
         kernel /= kernel.sum()
         return np.convolve(profile, kernel, mode="same")
 
-    def _extract_detections(self, roi, roi_x1, roi_y1, full_fgmask):
+    def _get_roi_bounds(self, frame_shape):
+        h, w = frame_shape[:2]
+        roi_y1 = int(h * 0.22)
+        roi_y2 = int(h * 0.41)
+        roi_x1 = max(0, self.cizgi_x - 260)
+        roi_x2 = min(w, self.cizgi_x + 210)
+        return roi_x1, roi_x2, roi_y1, roi_y2
+
+    def _normalize_roi(self, roi):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        gray = self.clahe.apply(gray)
+        return cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # ARTIK MOG2 MASKESİNİ BURADA DEĞİL, ANA DÖNGÜDEN ALIYORUZ
-        # Bu sayede ROI kayınca maske bozulmuyor.
-        roi_fgmask = full_fgmask[roi_y1 : roi_y1 + roi.shape[0], roi_x1 : roi_x1 + roi.shape[1]]
-        
-        bright_mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                          cv2.THRESH_BINARY, 11, 2)
-        final_mask = cv2.bitwise_and(roi_fgmask, bright_mask)
+    def _build_motion_mask(self, roi_gray):
+        if self.prev_roi_gray is None or self.prev_roi_gray.shape != roi_gray.shape:
+            self.prev_roi_gray = roi_gray.copy()
+            return np.zeros_like(roi_gray)
 
+        diff = roi_gray.astype(np.int16) - self.prev_roi_gray.astype(np.int16)
+        diff -= int(np.median(diff))
+        diff = np.abs(diff).clip(0, 255).astype(np.uint8)
+
+        _, motion_mask = cv2.threshold(
+            diff, self.aktif_ayar["motion_threshold"], 255, cv2.THRESH_BINARY
+        )
+        motion_mask = cv2.medianBlur(motion_mask, 5)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
+        motion_mask = cv2.dilate(motion_mask, kernel, iterations=1)
+
+        self.prev_roi_gray = roi_gray.copy()
+        return motion_mask
+
+    def _build_structure_mask(self, roi_gray):
+        bright_floor = np.percentile(roi_gray, self.aktif_ayar["bright_percentile"])
+        bright_floor = min(245, max(120, int(bright_floor)))
+        _, bright_mask = cv2.threshold(roi_gray, bright_floor, 255, cv2.THRESH_BINARY)
+
+        top_hat_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        top_hat = cv2.morphologyEx(roi_gray, cv2.MORPH_TOPHAT, top_hat_kernel)
+        _, detail_mask = cv2.threshold(top_hat, 12, 255, cv2.THRESH_BINARY)
+
+        structure_mask = cv2.bitwise_and(bright_mask, detail_mask)
+
+        ignore_start = int(roi_gray.shape[0] * 0.72)
+        structure_mask[ignore_start:, :] = 0
+        return structure_mask
+
+    def _extract_detections(self, frame, roi_x1, roi_x2, roi_y1, roi_y2):
+        roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+        roi_gray = self._normalize_roi(roi)
+        motion_mask = self._build_motion_mask(roi_gray)
+        structure_mask = self._build_structure_mask(roi_gray)
+
+        final_mask = cv2.bitwise_and(motion_mask, structure_mask)
         k_boyut = self.aktif_ayar["kernel"]
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_boyut, k_boyut))
         final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel)
         final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
+        final_mask = cv2.dilate(final_mask, kernel, iterations=1)
 
         contours, _ = cv2.findContours(
             final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -316,65 +374,61 @@ class CubukSayimSistemi(QMainWindow):
                 continue
 
             x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
-            
-            # MAKİNE ELEME: Daha sert oran kontrolü
-            if w_c > (self.aktif_ayar["limit_w"] * 2.5) or (float(w_c)/max(h_c,1) > 1.2):
+            if w_c < 4 or h_c < 4:
+                continue
+            if h_c > max(26, self.aktif_ayar["limit_h"] * 2):
                 continue
 
-            if w_c < 5 or h_c < 5:
+            aspect_ratio = float(w_c) / max(h_c, 1)
+            if aspect_ratio > 2.8:
                 continue
 
-            hull_area = max(cv2.contourArea(cv2.convexHull(cnt)), 1.0)
-            solidity = float(area) / hull_area
-            if (float(w_c) / max(h_c, 1)) <= 0.15 or solidity <= 0.28:
+            roi_gray_local = roi_gray[y_c:y_c + h_c, x_c:x_c + w_c]
+            if roi_gray_local.size == 0:
                 continue
 
-            roi_gray = gray[y_c : y_c + h_c, x_c : x_c + w_c]
-            if roi_gray.size == 0:
-                continue
-
-            horizontal_profile = np.mean(roi_gray, axis=0)
-            horizontal_profile = self._smooth_profile(horizontal_profile)
-
-            peak_threshold = max(
-                self.aktif_ayar["peak_threshold"] * 0.7, 
-                float(horizontal_profile.mean() + horizontal_profile.std() * 0.05),
-            )
-            
-            min_peak_gap = 4
-
-            peaks = []
-            for i in range(1, len(horizontal_profile) - 1):
-                center_val = horizontal_profile[i]
-                if (
-                    center_val >= horizontal_profile[i - 1]
-                    and center_val >= horizontal_profile[i + 1]
-                    and center_val >= peak_threshold
-                ):
-                    if not peaks or (i - peaks[-1]) > min_peak_gap:
-                        peaks.append(i)
-                    elif center_val > horizontal_profile[peaks[-1]]:
-                        peaks[-1] = i
-
-            if len(peaks) > 1:
-                for peak_x in peaks:
-                    detections.append(
-                        {
-                            "cx": x_c + peak_x + roi_x1,
-                            "cy": y_c + (h_c // 2) + roi_y1,
-                            "w": self.aktif_ayar["limit_w"],
-                            "h": h_c,
-                        }
-                    )
-            else:
-                detections.append(
-                    {
-                        "cx": x_c + (w_c // 2) + roi_x1,
-                        "cy": y_c + (h_c // 2) + roi_y1,
-                        "w": w_c,
-                        "h": h_c,
-                    }
+            if w_c > int(self.aktif_ayar["limit_w"] * 1.35):
+                profile = np.mean(roi_gray_local, axis=0)
+                profile = self._smooth_profile(profile)
+                min_peak_gap = max(8, int(self.aktif_ayar["limit_w"] * 0.7))
+                peak_floor = max(
+                    self.aktif_ayar["peak_threshold"],
+                    float(profile.mean() + profile.std() * 0.35),
                 )
+
+                peaks = []
+                for i in range(1, len(profile) - 1):
+                    center_val = profile[i]
+                    if (
+                        center_val >= profile[i - 1]
+                        and center_val >= profile[i + 1]
+                        and center_val >= peak_floor
+                    ):
+                        if not peaks or (i - peaks[-1]) > min_peak_gap:
+                            peaks.append(i)
+                        elif center_val > profile[peaks[-1]]:
+                            peaks[-1] = i
+
+                if len(peaks) > 1:
+                    for peak_x in peaks:
+                        detections.append(
+                            {
+                                "cx": x_c + peak_x + roi_x1,
+                                "cy": y_c + (h_c // 2) + roi_y1,
+                                "w": self.aktif_ayar["limit_w"],
+                                "h": h_c,
+                            }
+                        )
+                    continue
+
+            detections.append(
+                {
+                    "cx": x_c + (w_c // 2) + roi_x1,
+                    "cy": y_c + (h_c // 2) + roi_y1,
+                    "w": w_c,
+                    "h": h_c,
+                }
+            )
 
         detections.sort(key=lambda item: (item["cy"], item["cx"]))
         return detections, final_mask
@@ -400,7 +454,6 @@ class CubukSayimSistemi(QMainWindow):
             "max_x": detection["cx"],
             "w": detection["w"],
             "h": detection["h"],
-            "creation_frame": self.frame_index 
         }
 
     def _update_track(self, data, detection):
@@ -412,14 +465,14 @@ class CubukSayimSistemi(QMainWindow):
         if data["frames_seen"] == 1:
             vx, vy = inst_vx, inst_vy
         else:
-            vx = 0.65 * data["vx"] + 0.35 * inst_vx
-            vy = 0.65 * data["vy"] + 0.35 * inst_vy
+            vx = 0.60 * data["vx"] + 0.40 * inst_vx
+            vy = 0.60 * data["vy"] + 0.40 * inst_vy
 
         return {
             "cx": detection["cx"],
             "cy": detection["cy"],
-            "start_x": data.get("start_x", prev_x),
-            "start_y": data.get("start_y", prev_y),
+            "start_x": data["start_x"],
+            "start_y": data["start_y"],
             "prev_x": prev_x,
             "prev_y": prev_y,
             "vx": vx,
@@ -431,7 +484,6 @@ class CubukSayimSistemi(QMainWindow):
             "max_x": max(data["max_x"], detection["cx"]),
             "w": detection["w"],
             "h": detection["h"],
-            "creation_frame": data["creation_frame"]
         }
 
     def _match_tracks(self, detections):
@@ -441,8 +493,8 @@ class CubukSayimSistemi(QMainWindow):
             if data["missing"] <= self.track_timeout_frames
         }
         new_tracks = {}
-
         candidates = []
+
         for det_index, detection in enumerate(detections):
             for obj_id, data in available_tracks.items():
                 pred_x, pred_y = self._predict_position(data)
@@ -453,10 +505,10 @@ class CubukSayimSistemi(QMainWindow):
                     abs(data["vx"]) * (data["missing"] + 2) + self.count_band_half_width,
                 )
                 adaptive_y_limit = max(
-                    self.vertical_match_limit, detection["h"] * 0.7, data["h"] * 0.7
+                    self.vertical_match_limit, detection["h"] * 1.2, data["h"] * 1.2
                 )
                 if abs(dx) <= adaptive_x_limit and abs(dy) <= adaptive_y_limit:
-                    score = abs(dx) + abs(dy) * 2 + data["missing"] * 10
+                    score = abs(dx) + abs(dy) * 2 + data["missing"] * 12
                     candidates.append((score, obj_id, det_index))
 
         matched_tracks = set()
@@ -497,48 +549,69 @@ class CubukSayimSistemi(QMainWindow):
             if now - event["time"] <= self.count_cooldown_seconds
         ]
 
-    def _can_register_count(self, track):
+    def _can_register_count(self, track, direction):
         self._prune_count_events()
+        min_lane_gap = max(7, self.aktif_ayar["limit_h"] // 2)
         for event in self.recent_count_events:
-            if abs(event["cy"] - track["cy"]) <= 3:
+            if event["direction"] == direction and abs(event["cy"] - track["cy"]) <= min_lane_gap:
                 return False
         return True
 
-    def _register_count(self, track):
+    def _register_count(self, track, direction):
         self.sayilan_adet += 1
         self.label_sayac.setText(str(self.sayilan_adet))
         self.hedef_kontrol()
-        self.recent_count_events.append({"time": time.monotonic(), "cy": track["cy"]})
+        self.recent_count_events.append(
+            {"time": time.monotonic(), "cy": track["cy"], "direction": direction}
+        )
 
     def _count_if_needed(self):
-        # ISINMA VEYA TIKLAMA SONRASI BEKLEME
-        if self.frame_index < self.warmup_frames:
+        if self.frame_index < self.warmup_until_frame:
             return
 
-        for obj_id, data in self.tracked_objects.items():
+        for data in self.tracked_objects.values():
             if data["counted"] or data["missing"] > 0:
                 continue
 
-            ilk_gorulme_x = data.get("start_x", data["cx"])
-            su_anki_x = data["cx"]
+            net_dx = data["cx"] - data["start_x"]
+            avg_vx = net_dx / max(1, data["frames_seen"] - 1)
+            crossed_line = (
+                (data["prev_x"] <= self.cizgi_x < data["cx"])
+                or (data["cx"] < self.cizgi_x <= data["prev_x"])
+            )
+            touched_both_sides = (
+                data["min_x"] <= self.cizgi_x - self.count_band_half_width
+                and data["max_x"] >= self.cizgi_x + self.count_band_half_width
+            )
 
-            # Açılışta veya tıklama anında oluşan gürültüyü sayma
-            yeni_mi = data["creation_frame"] > (self.warmup_frames - 20)
+            direction = 1 if net_dx > 0 else -1
+            start_side_ok = (
+                data["start_x"] < self.cizgi_x - self.count_band_half_width
+                if direction > 0
+                else data["start_x"] > self.cizgi_x + self.count_band_half_width
+            )
+            end_side_ok = (
+                data["cx"] > self.cizgi_x + 6
+                if direction > 0
+                else data["cx"] < self.cizgi_x - 6
+            )
 
-            gelis_yeri_dogru_mu = ilk_gorulme_x < (self.cizgi_x - 40)
-            cizgiyi_gecti_mi = su_anki_x > (self.cizgi_x + 10)
-            gercek_seyahat_mi = (su_anki_x - ilk_gorulme_x) > 50
+            enough_motion = abs(net_dx) >= max(40, self.aktif_ayar["limit_w"] * 2)
+            stable_direction = abs(avg_vx) >= self.min_horizontal_speed and np.sign(avg_vx) == direction
+            stable_vertical_motion = abs(data["vy"]) <= self.max_vertical_speed
 
             if (
-                data["frames_seen"] >= self.min_frames_for_count 
-                and yeni_mi
-                and gelis_yeri_dogru_mu 
-                and cizgiyi_gecti_mi 
-                and gercek_seyahat_mi 
-                and self._can_register_count(data)
+                data["frames_seen"] >= 2
+                and enough_motion
+                and stable_direction
+                and stable_vertical_motion
+                and start_side_ok
+                and end_side_ok
+                and (crossed_line or touched_both_sides)
+                and self._can_register_count(data, direction)
             ):
                 data["counted"] = True
-                self._register_count(data)
+                self._register_count(data, direction)
 
     def main_loop(self):
         ret, frame = self.vs.read()
@@ -547,23 +620,17 @@ class CubukSayimSistemi(QMainWindow):
 
         self.frame_index += 1
         h, w = frame.shape[:2]
+        roi_x1, roi_x2, roi_y1, roi_y2 = self._get_roi_bounds(frame.shape)
 
-        # ÇÖZÜM: Arka plan çıkarmayı tüm frame üzerinde yapıyoruz (ROI bağımsızlığı)
-        full_fgmask = self.fgbg.apply(frame, learningRate=-1)
-
-        roi_y1, roi_y2 = int(h * 0.32), int(h * 0.48)
-        roi_x1 = max(0, self.cizgi_x - 250)
-        roi_x2 = min(w, self.cizgi_x + 250)
-        roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-
-        # Analiz fonksiyonuna tam maskeyi gönderiyoruz
-        detections, final_mask = self._extract_detections(roi, roi_x1, roi_y1, full_fgmask)
+        detections, final_mask = self._extract_detections(
+            frame, roi_x1, roi_x2, roi_y1, roi_y2
+        )
         self._match_tracks(detections)
         self._count_if_needed()
 
-        # Arayüz Çizimleri
-        cv2.rectangle(frame, (self.cizgi_x - 42, 0), (self.cizgi_x + 42, h), (0, 255, 255), 1)
-        cv2.line(frame, (self.cizgi_x, 0), (self.cizgi_x, h), (0, 0, 255), 2)
+        cv2.rectangle(frame, (self.cizgi_x - self.count_band_half_width, 0),
+                      (self.cizgi_x + self.count_band_half_width, h), (0, 255, 255), 2)
+        cv2.line(frame, (self.cizgi_x, 0), (self.cizgi_x, h), (0, 0, 255), 3)
         cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 255, 0), 1)
 
         for obj_id, data in self.tracked_objects.items():
@@ -572,13 +639,13 @@ class CubukSayimSistemi(QMainWindow):
 
             cx, cy = int(data["cx"]), int(data["cy"])
             color = (255, 0, 0) if data["counted"] else (0, 255, 0)
-            cv2.rectangle(frame, (cx - 11, cy - 11), (cx + 11, cy + 11), color, 2)
+            cv2.rectangle(frame, (cx - 10, cy - 10), (cx + 10, cy + 10), color, 2)
             cv2.putText(
                 frame,
                 f"ID {obj_id}",
                 (cx - 18, cy - 18),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                0.42,
                 color,
                 1,
             )
@@ -586,16 +653,16 @@ class CubukSayimSistemi(QMainWindow):
                 cv2.putText(
                     frame,
                     "SAYILDI",
-                    (cx - 25, cy - 28),
+                    (cx - 24, cy - 28),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
+                    0.52,
                     (255, 0, 0),
                     2,
                 )
 
         mask_bgr = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2BGR)
         frame[roi_y1:roi_y2, roi_x1:roi_x2] = cv2.addWeighted(
-            frame[roi_y1:roi_y2, roi_x1:roi_x2], 0.8, mask_bgr, 0.2, 0
+            frame[roi_y1:roi_y2, roi_x1:roi_x2], 0.82, mask_bgr, 0.18, 0
         )
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
